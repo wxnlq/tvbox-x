@@ -1,7 +1,8 @@
 # coding=utf-8
 """
-目标站: 4KVM  首页: https://www.4kvm.net
-功能: 动态筛选、精准分集、多线路、播放链接解析
+目标站: 4kvm  首页: https://www.4kvm.net
+动态筛选、精准分集、去重列表
+功能：完整实现爬虫逻辑，支持分类、筛选、搜索、详情、播放源解析
 """
 import re
 import sys
@@ -12,7 +13,6 @@ from bs4 import BeautifulSoup
 sys.path.append('..')
 from base.spider import Spider
 
-
 class Spider(Spider):
     def init(self, extend=""):
         self.site_url = "https://www.4kvm.net"
@@ -20,134 +20,175 @@ class Spider(Spider):
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Referer': self.site_url,
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         }
         self.categories = [
             {"type_id": "1", "type_name": "电影"},
             {"type_id": "2", "type_name": "电视剧"},
             {"type_id": "3", "type_name": "动漫"}
         ]
-        self._filters_cache = None
+        self._filters_cache = None  # 筛选条件缓存
+        self._seen_vod_ids = set()  # 去重集合
 
-    # ---------- 辅助方法 ----------
-    def _fetch_html(self, path, params=None):
-        """请求页面并返回BeautifulSoup对象，失败返回None"""
-        url = path if path.startswith('http') else self.site_url + path
-        if params:
-            query = urllib.parse.urlencode(params)
-            url = f"{url}?{query}" if '?' not in url else f"{url}&{query}"
-        resp = self.fetch(url, headers=self.headers)
-        if not resp:
-            return None
-        return BeautifulSoup(resp.text, 'html.parser')
+    # ================= 工具方法 =================
+    def _clear_seen(self):
+        """清空去重集合"""
+        self._seen_vod_ids.clear()
 
-    def _extract_video_card(self, card):
-        """从卡片div[data-vod-id]中提取视频信息"""
-        a = card.select_one('a.block[href^="/play/"]')
-        if not a:
-            return None
-        vod_id = card.get('data-vod-id', '').strip()
-        if not vod_id:
-            href = a.get('href', '')
-            vod_id = href.replace('/play/', '').strip()
-        if not vod_id:
-            return None
-        title_tag = card.select_one('h3.text-white') or card.select_one('h3')
-        vod_name = title_tag.get_text(strip=True) if title_tag else ''
-        if not vod_name:
-            return None
-        img = card.select_one('img[data-src]')
-        vod_pic = ''
-        if img:
-            src = img.get('data-src', '')
-            if src and not src.startswith('data:'):
-                vod_pic = src if src.startswith('http') else 'https:' + src
-        remark_tag = card.select_one('.text-green-500, .text-yellow-400, span[class*="px-1.5"]')
-        vod_remarks = remark_tag.get_text(strip=True) if remark_tag else ''
-        return {
-            "vod_id": vod_id,
-            "vod_name": vod_name,
-            "vod_pic": vod_pic,
-            "vod_remarks": vod_remarks
-        }
+    def _fix_url(self, url):
+        """补全URL"""
+        if not url:
+            return ""
+        if url.startswith('//'):
+            return f"https:{url}"
+        if url.startswith('/'):
+            return f"{self.site_url}{url}"
+        if not url.startswith('http'):
+            return f"{self.site_url}/{url.lstrip('/')}"
+        return url
 
-    def _extract_video_list(self, soup):
-        cards = soup.select('div[data-vod-id]')
-        videos = []
-        for card in cards:
-            v = self._extract_video_card(card)
-            if v:
-                videos.append(v)
-        return videos
+    def _safe_extract(self, elem, selector, attr=None, default=""):
+        """安全提取元素内容"""
+        target = elem.select_one(selector) if elem else None
+        if not target:
+            return default
+        if attr:
+            return target.get(attr, default).strip()
+        return target.get_text(strip=True) or default
 
-    # ---------- 动态筛选 ----------
+    # ================= 动态筛选解析 =================
     def _fetch_filters_for_classify(self, tid):
-        soup = self._fetch_html('/filter', params={'classify': tid})
-        if not soup:
-            return []
-        filter_groups = []
-        containers = soup.select('main div.flex.flex-wrap.items-center.gap-3')
-        for container in containers:
-            links = container.select('a[href]')
-            if len(links) < 2:
-                continue
-            first_text = links[0].get_text(strip=True)
-            if not first_text.startswith('全部'):
-                continue
-            group_name = first_text.replace('全部', '', 1).strip()
-            param_key = None
-            for a in links[1:]:
-                href = a.get('href', '')
-                parsed = urllib.parse.urlparse(href)
-                qs = urllib.parse.parse_qs(parsed.query)
-                for k in qs:
-                    if k not in ('classify', 'page'):
-                        param_key = k
+        """请求 /filter?classify=tid，解析页面筛选区域，返回该分类的筛选列表"""
+        try:
+            url = f"{self.site_url}/filter?classify={tid}"
+            resp = self.fetch(url, headers=self.headers, timeout=10)
+            if not resp:
+                return []
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            filter_groups = []
+            # 匹配筛选容器（兼容不同布局）
+            containers = soup.select('main div.flex.flex-wrap.items-center.gap-3, div.filter-group')
+            
+            for container in containers:
+                links = container.select('a[href]')
+                if len(links) < 2:
+                    continue
+                
+                first_text = self._safe_extract(container, 'a:first-child')
+                if not first_text.startswith('全部'):
+                    continue
+                
+                group_name = first_text.replace('全部', '').strip() or f"筛选{len(filter_groups)+1}"
+                param_key = None
+                
+                # 提取筛选参数名
+                for a in links[1:]:
+                    href = self._safe_extract(a, '', 'href')
+                    parsed = urllib.parse.urlparse(href)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    for k in qs:
+                        if k not in ('classify', 'page', 'sort_by', 'order'):
+                            param_key = k
+                            break
+                    if param_key:
                         break
-                if param_key:
-                    break
-            if not param_key or param_key in ('sort_by', 'order'):
-                continue
-            options = []
-            for a in links:
-                text = a.get_text(strip=True)
-                href = a.get('href', '')
-                parsed = urllib.parse.urlparse(href)
-                qs = urllib.parse.parse_qs(parsed.query)
-                val = qs.get(param_key, [''])[0] if param_key in qs else ''
-                if text.startswith('全部'):
-                    val = ''
-                options.append({"n": text, "v": val})
-            if options:
-                filter_groups.append({
-                    "key": param_key,
-                    "name": group_name,
-                    "value": options
-                })
-        return filter_groups
+                
+                if not param_key:
+                    continue
+                
+                # 构建筛选选项
+                options = []
+                for a in links:
+                    text = self._safe_extract(a, '')
+                    href = self._safe_extract(a, '', 'href')
+                    parsed = urllib.parse.urlparse(href)
+                    qs = urllib.parse.parse_qs(parsed.query)
+                    val = qs.get(param_key, [''])[0] if param_key in qs else ''
+                    if text.startswith('全部'):
+                        val = ''
+                    options.append({"n": text, "v": val})
+                
+                if options:
+                    filter_groups.append({
+                        "key": param_key,
+                        "name": group_name,
+                        "value": options
+                    })
+            return filter_groups
+        except Exception as e:
+            print(f"解析筛选条件失败: {e}")
+            return []
 
     def _get_all_filters(self):
+        """获取所有分类的筛选条件（带缓存）"""
         if self._filters_cache is not None:
             return self._filters_cache
+        
         filters = {}
         for cat in self.categories:
             tid = cat["type_id"]
             groups = self._fetch_filters_for_classify(tid)
             if groups:
                 filters[tid] = groups
+        
+        # 为无筛选的分类复用电影分类的筛选
         if "1" in filters:
-            for cid in ["3", "4"]:
-                if cid not in filters:
-                    filters[cid] = filters["1"]
+            for tid in ["2", "3"]:
+                if tid not in filters:
+                    filters[tid] = filters["1"]
+        
         self._filters_cache = filters
         return filters
 
-    # ---------- 首页 ----------
+    # ================= 核心业务方法 =================
     def homeContent(self, filter):
-        soup = self._fetch_html('/')
+        """首页内容（分类+推荐列表+筛选条件）"""
+        self._clear_seen()
         video_list = []
-        if soup:
-            video_list = self._extract_video_list(soup)[:20]
+        try:
+            resp = self.fetch(self.site_url, headers=self.headers, timeout=10)
+            if resp:
+                soup = BeautifulSoup(resp.text, 'html.parser')
+                # 解析视频卡片（兼容多布局）
+                cards = soup.select('div[data-vod-id], div[class*="vod-card"], a[href^="/play/"]:has(img)')
+                
+                for card in cards[:20]:  # 首页只取前20条
+                    # 提取vod_id
+                    vod_id = card.get('data-vod-id', '').strip()
+                    if not vod_id:
+                        href = self._safe_extract(card, 'a.block[href^="/play/"]', 'href') or self._safe_extract(card, '', 'href')
+                        vod_id = re.sub(r'^/play/', '', href).strip()
+                    if not vod_id or vod_id in self._seen_vod_ids:
+                        continue
+                    
+                    # 提取基础信息
+                    vod_name = self._safe_extract(card, 'h3.text-white, h3, .vod-title')
+                    vod_pic = self._safe_extract(card, 'img[data-src], img[src]', 'data-src') or self._safe_extract(card, 'img[data-src], img[src]', 'src')
+                    vod_remarks = self._safe_extract(card, '.text-green-500, .text-yellow-400, span[class*="px-1.5"], .vod-tag')
+                    
+                    # 数据校验
+                    if not vod_name:
+                        continue
+                    
+                    # 补全图片URL
+                    vod_pic = self._fix_url(vod_pic)
+                    if 'nopic' in vod_pic.lower() or not vod_pic:
+                        vod_pic = ""
+                    
+                    # 去重并添加
+                    self._seen_vod_ids.add(vod_id)
+                    video_list.append({
+                        "vod_id": vod_id,
+                        "vod_name": vod_name,
+                        "vod_pic": vod_pic,
+                        "vod_remarks": vod_remarks
+                    })
+        except Exception as e:
+            print(f"解析首页内容失败: {e}")
+        
         return {
             "class": self.categories,
             "list": video_list,
@@ -155,257 +196,358 @@ class Spider(Spider):
         }
 
     def homeVideoContent(self):
+        """首页视频列表（复用homeContent）"""
         return self.homeContent(False)
 
-    # ---------- 分类页 ----------
     def categoryContent(self, tid, pg, filter, extend):
-        page = int(pg) if pg else 1
-        params = {"classify": tid}
-        if extend:
-            for k, v in extend.items():
-                if v and k != 'classify':
-                    params[k] = v
-        if page > 1:
-            params['page'] = page
-
-        soup = self._fetch_html('/filter', params=params)
-        if not soup:
-            return {"list": [], "page": page, "pagecount": 1, "limit": 24, "total": 0}
-
-        video_list = self._extract_video_list(soup)
-
-        # 解析总页数
-        pagecount = page
-        page_text = soup.find(string=re.compile(r'共\s*\d+\s*页'))
-        if page_text:
-            nums = re.findall(r'\d+', page_text)
-            if nums:
-                pagecount = int(nums[-1])
-        else:
-            page_block = soup.select_one('.flex.justify-center')
-            if page_block:
-                page_links = page_block.select('a[href*="page="]')
+        """分类内容（带分页+筛选）"""
+        self._clear_seen()
+        page = int(pg) if pg and pg.isdigit() else 1
+        video_list = []
+        pagecount = 1
+        total = 0
+        
+        try:
+            # 构建请求参数
+            params = {"classify": tid}
+            if extend and isinstance(extend, dict):
+                for k, v in extend.items():
+                    if v and k not in ('classify', 'page'):
+                        params[k] = v
+            if page > 1:
+                params['page'] = page
+            
+            # 构建请求URL
+            query = urllib.parse.urlencode(params)
+            url = f"{self.site_url}/filter?{query}"
+            resp = self.fetch(url, headers=self.headers, timeout=10)
+            
+            if not resp:
+                return {"list": [], "page": page, "pagecount": 1, "limit": 24, "total": 0}
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # 解析视频列表
+            cards = soup.select('div[data-vod-id], div[class*="vod-card"], a[href^="/play/"]:has(img)')
+            for card in cards:
+                # 提取vod_id
+                vod_id = card.get('data-vod-id', '').strip()
+                if not vod_id:
+                    href = self._safe_extract(card, 'a.block[href^="/play/"]', 'href') or self._safe_extract(card, '', 'href')
+                    vod_id = re.sub(r'^/play/', '', href).strip()
+                if not vod_id or vod_id in self._seen_vod_ids:
+                    continue
+                
+                # 提取基础信息
+                vod_name = self._safe_extract(card, 'h3.text-white, h3, .vod-title')
+                vod_pic = self._safe_extract(card, 'img[data-src], img[src]', 'data-src') or self._safe_extract(card, 'img[data-src], img[src]', 'src')
+                vod_remarks = self._safe_extract(card, '.text-green-500, .text-yellow-400, span[class*="px-1.5"], .vod-tag')
+                
+                # 数据校验
+                if not vod_name:
+                    continue
+                
+                # 补全图片URL
+                vod_pic = self._fix_url(vod_pic)
+                if 'nopic' in vod_pic.lower() or not vod_pic:
+                    vod_pic = ""
+                
+                # 去重并添加
+                self._seen_vod_ids.add(vod_id)
+                video_list.append({
+                    "vod_id": vod_id,
+                    "vod_name": vod_name,
+                    "vod_pic": vod_pic,
+                    "vod_remarks": vod_remarks
+                })
+            
+            # 解析分页信息
+            # 方式1：匹配"共X页"文本
+            page_text = soup.find(string=re.compile(r'共\s*\d+\s*页'))
+            if page_text:
+                nums = re.findall(r'\d+', page_text)
+                if nums:
+                    pagecount = int(nums[-1])
+            # 方式2：解析分页链接
+            else:
+                page_links = soup.select('a[href*="page="]')
                 for a in page_links:
-                    text = a.get_text(strip=True)
+                    text = self._safe_extract(a, '')
                     if text.isdigit():
                         pagecount = max(pagecount, int(text))
+            
+            # 计算总数
+            total = len(video_list) * pagecount if pagecount > 0 else 0
+            
+        except Exception as e:
+            print(f"解析分类内容失败: {e}")
+        
         return {
             "list": video_list,
             "page": page,
             "pagecount": pagecount,
             "limit": 24,
-            "total": len(video_list) * pagecount
+            "total": total
         }
 
-    # ---------- 详情页 ----------
     def detailContent(self, ids):
-        if not ids:
+        """详情页内容（含分集播放地址）"""
+        if not ids or not ids[0]:
             return {"list": []}
-        vod_id = ids[0]
-        soup = self._fetch_html(f'/play/{vod_id}')
-        if not soup:
-            return {"list": []}
-
-        # 标题
-        title_elem = soup.select_one('h1.text-xl') or soup.select_one('h1') or soup.select_one('h2')
-        vod_name = title_elem.get_text(strip=True) if title_elem else vod_id
-
-        # 图片
-        vod_pic = ''
-        img_elem = soup.select_one('img.w-full') or soup.select_one('img[src]')
-        if img_elem:
-            src = img_elem.get('src', '') or img_elem.get('data-src', '')
-            if src and not src.startswith('data:'):
-                vod_pic = src if src.startswith('http') else 'https:' + src
-
-        # 导演、演员、简介
-        vod_director = ''
-        vod_actor = ''
-        vod_content = ''
-        info_block = soup.select_one('.rounded-lg div.grid') or soup.select_one('div.grid')
-        if info_block:
-            text = info_block.get_text(' ', strip=True)
-            dir_match = re.search(r'导演\s*([^主\n]+)', text)
-            if dir_match:
-                vod_director = dir_match.group(1).strip()
-            act_match = re.search(r'主演\s*([^剧\n]+)', text)
-            if act_match:
-                vod_actor = act_match.group(1).strip()
-            desc_match = re.search(r'剧情简介\s*(.+)', text, re.DOTALL)
-            if desc_match:
-                vod_content = desc_match.group(1).strip()
-            elif re.search(r'简介\s*(.+)', text, re.DOTALL):
-                vod_content = re.search(r'简介\s*(.+)', text, re.DOTALL).group(1).strip()
-
-        # ---------- 分集解析（多线路）----------
+        
+        vod_id = ids[0].strip()
+        result = []
         play_from_list = []
         play_url_list = []
-
-        # 尝试从 episodeManager 解析
-        ep_manager = soup.select_one('[x-data*="episodeManager"]')
-        if ep_manager:
-            xdata = ep_manager.get('x-data', '')
-            # 提取线路名称列表：episodeManager(1, 1, [{ lineName: 'alists', episodeCount: 1 }])
-            lines_name = []
-            match_lines = re.search(r'\[\s*\{[^}]*lineName\s*:\s*\'([^\']+)\'[^}]*\}\s*\]', xdata)
-            if match_lines:
-                lines_name = [match_lines.group(1)]
-            else:
-                # 尝试匹配多个
-                lines_name = re.findall(r'lineName\s*:\s*\'([^\']+)\'', xdata)
-            if not lines_name:
-                lines_name = ['线路1']
-
-            # 收集所有剧集链接
-            episode_links = ep_manager.select('a[data-episode]')
-            lines_eps = {}
-            for a in episode_links:
-                line = a.get('data-line', '1')
-                ep = a.get('data-episode', '')
-                href = a.get('href', '')
-                if not href or not ep:
-                    continue
-                full_url = href if href.startswith('http') else self.site_url + href
-                lines_eps.setdefault(line, []).append((int(ep), full_url))
-
-            # 按线路生成播放串
-            for idx, line_key in enumerate(sorted(lines_eps.keys())):
-                eps = sorted(lines_eps[line_key], key=lambda x: x[0])
-                line_name = lines_name[idx] if idx < len(lines_name) else f'线路{line_key}'
-                if not eps:
-                    continue
-                episode_strs = [f"第{ep[0]}集${ep[1]}" for ep in eps]
-                play_from_list.append(line_name)
-                play_url_list.append('#'.join(episode_strs))
-
-        # 如果没有分集（单集电影），则直接使用当前页
-        if not play_url_list:
-            play_from_list.append('播放')
-            play_url_list.append(f"正片${self.site_url}/play/{vod_id}")
-
-        vod_play_from = '$$$'.join(play_from_list)
-        vod_play_url = '$$$'.join(play_url_list)
-
-        result = [{
-            "vod_id": vod_id,
-            "vod_name": vod_name,
-            "vod_pic": vod_pic,
-            "vod_content": vod_content,
-            "vod_actor": vod_actor,
-            "vod_director": vod_director,
-            "vod_area": "",
-            "vod_year": "",
-            "vod_play_from": vod_play_from,
-            "vod_play_url": vod_play_url
-        }]
+        
+        try:
+            # 请求详情页
+            url = f"{self.site_url}/play/{vod_id}"
+            resp = self.fetch(url, headers=self.headers, timeout=10)
+            if not resp or resp.status_code != 200:
+                return {"list": []}
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # 1. 基础信息解析
+            vod_name = self._safe_extract(soup, 'h1.text-xl, h1, h2, .vod-name') or vod_id
+            vod_pic = self._safe_extract(soup, 'img.w-full, img[src], img[data-src]', 'data-src') or self._safe_extract(soup, 'img.w-full, img[src], img[data-src]', 'src')
+            vod_pic = self._fix_url(vod_pic)
+            if 'nopic' in vod_pic.lower() or not vod_pic:
+                vod_pic = ""
+            
+            # 2. 导演/主演/简介解析
+            vod_director = ""
+            vod_actor = ""
+            vod_content = ""
+            info_block = soup.select_one('.rounded-lg div.grid, div.grid, .vod-info, .info-block')
+            
+            if info_block:
+                info_text = info_block.get_text(' ', strip=True)
+                # 解析导演
+                dir_match = re.search(r'导演\s*[:：]?\s*([^主演主演剧]+)', info_text)
+                if dir_match:
+                    vod_director = dir_match.group(1).strip()
+                # 解析主演
+                act_match = re.search(r'主演\s*[:：]?\s*([^剧情简介]+)', info_text)
+                if act_match:
+                    vod_actor = act_match.group(1).strip()
+                # 解析简介
+                desc_match = re.search(r'剧情简介\s*[:：]?\s*(.+)', info_text, re.DOTALL)
+                if not desc_match:
+                    desc_match = re.search(r'简介\s*[:：]?\s*(.+)', info_text, re.DOTALL)
+                if desc_match:
+                    vod_content = desc_match.group(1).strip()
+            
+            # 3. 播放源/分集解析（核心）
+            # 方式1：解析episodeManager（动态渲染的分集）
+            episode_manager = soup.select_one('[x-data*="episodeManager"], .episode-list, .play-list')
+            if episode_manager:
+                # 提取线路信息
+                line_names = []
+                line_matches = re.findall(r'lineName\s*:\s*[\'"]([^\'"]+)', episode_manager.get('x-data', ''))
+                if line_matches:
+                    line_names = line_matches
+                else:
+                    # 回退：从DOM提取线路名
+                    line_elems = episode_manager.select('.line-name, .play-source-name')
+                    line_names = [self._safe_extract(elem, '') for elem in line_elems if self._safe_extract(elem, '')]
+                
+                # 提取分集链接
+                episode_links = episode_manager.select('a[data-episode], a[href*="/play/"], a[class*="episode"]')
+                line_eps = {}  # 按线路分组存储分集 {线路名: [(集数, 播放地址), ...]}
+                
+                for a in episode_links:
+                    # 提取线路标识
+                    line_key = a.get('data-line', '1')
+                    line_name = line_names[int(line_key)-1] if (line_names and int(line_key)-1 < len(line_names)) else f'线路{line_key}'
+                    # 提取集数和播放地址
+                    ep_num = self._safe_extract(a, '', 'data-episode') or self._safe_extract(a, '')
+                    ep_href = self._safe_extract(a, '', 'href')
+                    
+                    if not ep_href or not ep_num:
+                        continue
+                    
+                    # 补全播放地址
+                    full_url = self._fix_url(ep_href)
+                    # 格式化分集字符串（格式："第1集$播放地址"）
+                    line_eps.setdefault(line_name, []).append((ep_num, full_url))
+                
+                # 整理播放源
+                for line_name, eps in line_eps.items():
+                    # 集数排序
+                    eps_sorted = sorted(eps, key=lambda x: int(re.findall(r'\d+', x[0])[0]) if re.findall(r'\d+', x[0]) else 0)
+                    # 拼接成分集字符串
+                    ep_strs = [f"{ep[0]}${ep[1]}" for ep in eps_sorted]
+                    if ep_strs:
+                        play_from_list.append(line_name)
+                        play_url_list.append('#'.join(ep_strs))
+            
+            # 方式2：解析播放器容器中的真实播放地址（直接播放的场景）
+            if not play_url_list:
+                # 查找播放器配置
+                player_script = soup.find('script', string=re.compile(r'player|video|src|url'))
+                if player_script:
+                    # 提取m3u8/mp4等真实播放地址
+                    url_matches = re.findall(r'https?://[^\s"\']+\.(m3u8|mp4|flv|mov)', player_script.text)
+                    if url_matches:
+                        play_from_list.append('默认线路')
+                        play_url_list.append(f"播放${url_matches[0]}")
+                # 回退：使用当前页作为播放地址
+                else:
+                    play_from_list.append('默认线路')
+                    play_url_list.append(f"播放${self._fix_url(f'/play/{vod_id}')}")
+            
+            # 4. 组装结果
+            vod_play_from = '$$$'.join(play_from_list)
+            vod_play_url = '$$$'.join(play_url_list)
+            
+            result.append({
+                "vod_id": vod_id,
+                "vod_name": vod_name,
+                "vod_pic": vod_pic,
+                "vod_director": vod_director,
+                "vod_actor": vod_actor,
+                "vod_content": vod_content,
+                "vod_area": "",
+                "vod_year": "",
+                "vod_play_from": vod_play_from,
+                "vod_play_url": vod_play_url
+            })
+            
+        except Exception as e:
+            print(f"解析详情页失败: {e}")
+        
         return {"list": result}
 
-    # ---------- 搜索 ----------
     def searchContent(self, key, quick, pg="1"):
-        page = int(pg) if pg else 1
-        params = {"q": key}
-        if page > 1:
-            params['page'] = page
-        soup = self._fetch_html('/search', params=params)
-        if not soup:
-            return {"list": [], "page": page, "pagecount": 1}
-
-        cards = soup.select('div[data-vod-id]')
+        """搜索功能"""
+        self._clear_seen()
+        page = int(pg) if pg and pg.isdigit() else 1
         video_list = []
-        if cards:
-            for card in cards[:30]:
-                v = self._extract_video_card(card)
-                if v:
-                    video_list.append(v)
-        else:
-            # 降级解析
-            for a in soup.select('a.block[href^="/play/"]'):
-                href = a.get('href', '')
-                vod_id = href.replace('/play/', '').strip()
+        
+        try:
+            # 构建搜索URL
+            params = {"q": key}
+            if page > 1:
+                params['page'] = page
+            query = urllib.parse.urlencode(params)
+            url = f"{self.site_url}/search?{query}"
+            
+            resp = self.fetch(url, headers=self.headers, timeout=10)
+            if not resp:
+                return {"list": [], "page": page, "pagecount": 1}
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            
+            # 解析搜索结果
+            cards = soup.select('div[data-vod-id], div[class*="vod-card"], a[href^="/play/"]:has(img)')
+            if not cards:
+                # 降级处理：直接查找所有播放链接
+                cards = soup.select('a[href^="/play/"]')
+            
+            for card in cards[:30]:  # 搜索结果最多取30条
+                # 提取vod_id
+                vod_id = card.get('data-vod-id', '').strip()
                 if not vod_id:
+                    href = self._safe_extract(card, '', 'href')
+                    vod_id = re.sub(r'^/play/', '', href).strip()
+                if not vod_id or vod_id in self._seen_vod_ids:
                     continue
-                h3 = a.select_one('h3')
-                vod_name = h3.get_text(strip=True) if h3 else href
+                
+                # 提取基础信息
+                vod_name = self._safe_extract(card, 'h3.text-white, h3, .vod-title, .search-title')
+                vod_pic = self._safe_extract(card, 'img[data-src], img[src]', 'data-src') or self._safe_extract(card, 'img[data-src], img[src]', 'src')
+                vod_remarks = self._safe_extract(card, '.text-green-500, .text-yellow-400, span[class*="px-1.5"], .vod-tag')
+                
+                # 数据校验
                 if not vod_name:
                     continue
-                img = a.select_one('img[data-src]')
-                vod_pic = ''
-                if img:
-                    src = img.get('data-src', '')
-                    if src and not src.startswith('data:'):
-                        vod_pic = src if src.startswith('http') else 'https:' + src
+                
+                # 补全图片URL
+                vod_pic = self._fix_url(vod_pic)
+                if 'nopic' in vod_pic.lower() or not vod_pic:
+                    vod_pic = ""
+                
+                # 去重并添加
+                self._seen_vod_ids.add(vod_id)
                 video_list.append({
                     "vod_id": vod_id,
                     "vod_name": vod_name,
                     "vod_pic": vod_pic,
-                    "vod_remarks": ''
+                    "vod_remarks": vod_remarks
                 })
-        return {"list": video_list, "page": page, "pagecount": 1}
+                
+        except Exception as e:
+            print(f"解析搜索结果失败: {e}")
+        
+        return {
+            "list": video_list,
+            "page": page,
+            "pagecount": 1  # 搜索页默认1页，可根据实际分页调整
+        }
 
-    # ---------- 播放器：从播放页面提取真实视频地址 ----------
     def playerContent(self, flag, id, vipFlags):
-        # id 可能是 /play/xxxx 或完整URL，也可能是直接带$符号的完整链接（由vod_play_url传入）
-        if '$' in id:
-            # 格式为 "第x集$url"，提取url部分
-            parts = id.split('$', 1)
-            if len(parts) == 2:
-                id = parts[1]
+        """解析播放地址（核心：获取真实播放源）"""
+        try:
+            # 1. 处理ID，补全URL
+            if not id.startswith('http'):
+                play_url = f"{self.site_url}/play/{id}"
+            else:
+                play_url = id
+            
+            # 2. 请求播放页，提取真实播放地址
+            resp = self.fetch(play_url, headers=self.headers, timeout=15)
+            if not resp:
+                return {"parse": 1, "url": play_url, "header": self.headers}
+            
+            soup = BeautifulSoup(resp.text, 'html.parser')
+            html_text = resp.text
+            
+            # 3. 提取真实播放地址（优先级：m3u8 > mp4 > flv > 原页）
+            # 方式1：从JS变量中提取
+            url_matches = re.findall(r'var\s+[^\s=]+\s*=\s*[\'"](https?://[^\s"\']+\.(m3u8|mp4|flv))[\'"]', html_text)
+            if url_matches:
+                real_url = url_matches[0][0]
+                header = {
+                    'User-Agent': self.headers['User-Agent'],
+                    'Referer': self.site_url + '/'
+                }
+                # 直接返回可播放的地址（无需二次解析）
+                if real_url.endswith(('.m3u8', '.mp4', '.flv')):
+                    return {"parse": 0, "url": real_url, "header": header}
+                else:
+                    return {"parse": 1, "url": real_url, "header": header}
+            
+            # 方式2：从iframe中提取
+            iframe = soup.select_one('iframe[src]')
+            if iframe:
+                iframe_src = self._fix_url(self._safe_extract(iframe, '', 'src'))
+                return {"parse": 1, "url": iframe_src, "header": self.headers}
+            
+            # 方式3：从播放器容器提取
+            player_div = soup.select_one('#player, .player-container, [id*="player"]')
+            if player_div:
+                # 查找内嵌的播放地址
+                data_src = self._safe_extract(player_div, '', 'data-src') or self._safe_extract(player_div, '', 'data-url')
+                if data_src:
+                    real_url = self._fix_url(data_src)
+                    return {"parse": 0 if real_url.endswith(('.m3u8', '.mp4')) else 1, "url": real_url, "header": self.headers}
+            
+            # 回退：返回原地址，由上层解析
+            return {"parse": 1, "url": play_url, "header": self.headers}
+            
+        except Exception as e:
+            print(f"解析播放地址失败: {e}")
+            return {"parse": 1, "url": id if id.startswith('http') else f"{self.site_url}/play/{id}", "header": self.headers}
 
-        if not id.startswith('http'):
-            url = f"{self.site_url}{id}" if id.startswith('/') else f"{self.site_url}/play/{id}"
-        else:
-            url = id
-
-        # 请求播放页面
-        resp = self.fetch(url, headers=self.headers)
-        if not resp:
-            return {"parse": 1, "url": url, "header": self.headers}
-
-        html = resp.text
-
-        # 方法1: 查找 var player_aaaa = {...}
-        match = re.search(r'var\s+player_aaaa\s*=\s*(\{.*?\});', html, re.S)
-        if match:
-            try:
-                data = json.loads(match.group(1))
-                video_url = data.get('url', '')
-                if video_url and (video_url.endswith('.m3u8') or video_url.endswith('.mp4')):
-                    return {"parse": 0, "url": video_url, "header": self.headers}
-            except:
-                pass
-
-        # 方法2: 查找 "url":"http...m3u8"
-        match = re.search(r'"url"\s*:\s*"([^"]+\.m3u8[^"]*)"', html)
-        if match:
-            video_url = match.group(1).replace('\\/', '/')
-            return {"parse": 0, "url": video_url, "header": self.headers}
-
-        # 方法3: 查找 video 标签的 src
-        match = re.search(r'<video[^>]+src="([^"]+\.m3u8[^"]*)"', html)
-        if match:
-            video_url = match.group(1)
-            return {"parse": 0, "url": video_url, "header": self.headers}
-
-        # 方法4: 查找 source 标签
-        match = re.search(r'<source\s+src="([^"]+\.m3u8[^"]*)"', html)
-        if match:
-            video_url = match.group(1)
-            return {"parse": 0, "url": video_url, "header": self.headers}
-
-        # 方法5: 查找 window._pdf 或其它加密变量（简单解码）
-        # 示例: window._pdf = "WyJvc3MuZG91eWluYml0LmNvbSIsIm15b3NzLmRvdXlpbmJpdC50b3AiXQ=="
-        match_pdf = re.search(r'window\._pdf\s*=\s*"([^"]+)"', html)
-        if match_pdf:
-            try:
-                import base64
-                decoded = base64.b64decode(match_pdf.group(1)).decode('utf-8')
-                # 可能得到域名列表，但还需结合vid构造url，暂不处理
-            except:
-                pass
-
-        # 无法解析真实地址，返回页面URL让外部解析器处理
-        return {"parse": 1, "url": url, "header": self.headers}
-
-    # 可选：本地代理（本例不需要）
+    # 以下为可选实现（根据base.spider要求）
     def localProxy(self, param=''):
         return {}
+
+    def isVideoFormat(self, url):
+        """判断是否为直接播放的视频格式"""
+        return url.endswith(('.m3u8', '.mp4', '.flv', '.mov', '.avi'))
+
+    def manualVideoCheck(self):
+        return False
